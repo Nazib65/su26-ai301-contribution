@@ -11,7 +11,7 @@
 
 I chose this issue because InvenTree is real inventory-management software used by actual teams to track physical stock, so a fix here has tangible impact rather than being a toy exercise. The problem is also concrete and easy to explain: trackable parts currently *allow* serial numbers but can't *require* them, which lets stock be received with missing serials. Knowing what "done" looks like up front makes it a good fit for a focused 3–4 week contribution.
 
-It matches my skills and learning goals well. The core of the fix lives in the Python/Django backend — adding a field to the Part model, a database migration, serializer changes, and validation logic when receiving stock — which is exactly the area I want more experience in. It also reaches into the React frontend for a toggle in the part settings, so I get full-stack exposure in one contribution. I hope to learn how a mature Django project structures models, migrations, and validation, and how backend rules surface in the UI. [Add a sentence in your own words about what specifically excites you here.]
+It matches my skills and learning goals well. The core of the fix lives in the Python/Django backend — adding a field to the Part model, a database migration, serializer changes, and validation logic when receiving stock — which is exactly the area I want more experience in. It also reaches into the React frontend for a toggle in the part settings, so I get full-stack exposure in one contribution. I hope to learn how a mature Django project structures models, migrations, and validation, and how backend rules surface in the UI. I am very much excited to work here as this experience is pretty new to me and hope to enjoy throughout the process.
 
 ---
 
