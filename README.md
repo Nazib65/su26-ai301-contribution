@@ -1,17 +1,17 @@
-# Contribution [1]: [FR] Required serials
+# Contribution #1: feat: Respect RateLimit headers in default REST backoff implementation
 
 **Contribution Number:** 1
 **Student:** Nazib Irfan Khan  
-**Issue:** https://github.com/inventree/InvenTree/issues/11258  
+**Issue:** https://github.com/meltano/sdk/issues/2012  
 **Status:** Phase I Complete
 
 ---
 
 ## Why I Chose This Issue
 
-I chose this issue because InvenTree is real inventory-management software used by actual teams to track physical stock, so a fix here has tangible impact rather than being a toy exercise. The problem is also concrete and easy to explain: trackable parts currently *allow* serial numbers but can't *require* them, which lets stock be received with missing serials. Knowing what "done" looks like up front makes it a good fit for a focused 3–4 week contribution.
+I chose this issue because the Meltano Singer SDK is a real, widely-used Python framework that hundreds of data "taps" and "targets" are built on, so improving its default behavior helps every connector that talks to a rate-limited REST API — not just one app. The problem is also very well-scoped and easy to explain: when an API replies with the standard `X-RateLimit-*` headers, the SDK currently ignores them and just backs off exponentially, instead of waiting the exact amount of time the server tells it to. Knowing what "done" looks like makes it a good fit for a focused 3–4 week contribution.
 
-It matches my skills and learning goals well. The core of the fix lives in the Python/Django backend — adding a field to the Part model, a database migration, serializer changes, and validation logic when receiving stock — which is exactly the area I want more experience in. It also reaches into the React frontend for a toggle in the part settings, so I get full-stack exposure in one contribution. I hope to learn how a mature Django project structures models, migrations, and validation, and how backend rules surface in the UI. I am very much excited to work here as this experience is pretty new to me and hope to enjoy throughout the process.
+It matches my skills and learning goals well. The fix lives entirely in the Python backend (`singer_sdk/streams/rest.py`) around HTTP retry/backoff logic — no frontend — which is exactly the kind of focused backend work I want more experience in. I'll get to learn how a mature SDK structures retry handling with the `backoff` library, how HTTP rate-limit headers (the IETF `RateLimit` draft) work in practice, and how to keep a change backwards-compatible in a framework other people extend. The issue is labelled `good first issue` and `Accepting Pull Requests`, and the maintainer (@ReubenFrankel) has already replied to confirm the direction, so I'm starting with a clear green light. I am very much excited to work here as this experience is pretty new to me and hope to enjoy throughout the process.
 
 ---
 
@@ -19,27 +19,28 @@ It matches my skills and learning goals well. The core of the fix lives in the P
 
 ### Problem Description
 
-Parts may be trackable, which allows but does not require serial numbers to be assigned to stock items. In my use of inventree, almost all trackable parts (whether serials are assigned by "us" or by an external manufacturer) should always have a serial number assigned - but currently this cannot be enforced which can lead to missing serials and mistakes when receiving stock.
+The [IETF RateLimit headers draft](https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers/) defines a set of response headers — `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset` — that an API uses to tell a client how many requests it has left and when the limit resets. Taps built with the Singer SDK around REST APIs that send these headers would benefit from a default `RESTStream` backoff that understands and respects them — namely `X-RateLimit-Reset`, so the tap waits exactly until the window resets instead of guessing.
 
 ### Expected Behavior
 
-A maintainer should be able to mark a part so that serial numbers are **mandatory**. When stock for such a part is created or received without a serial number, InvenTree should reject the operation with a clear validation error — the same way it already rejects duplicate serials or non-integer quantities for trackable parts.
+When a request is throttled (e.g. HTTP 429) and the response carries `X-RateLimit-Reset` (or the related `Retry-After` header), the SDK's **default** backoff should wait the duration indicated by that header before retrying, out of the box, without each tap author having to write custom backoff code. When no such header is present, it should fall back to the current exponential backoff.
 
 ### Current Behavior
 
-A trackable part accepts stock items with an empty/null serial. The validation in `stock/models.py` (`clean()` / `validate_unique()`) only enforces rules *when a serial is present* (quantity must be 1, serial must be unique). Nothing forces a serial to be present in the first place, so stock can be received un-serialized with no warning.
+The default backoff ignores response headers entirely. `RESTStream.backoff_wait_generator()` returns `backoff.expo(factor=2)` — a fixed exponential schedule with jitter — regardless of what the server says. `validate_response()` raises `RetriableAPIError` for 429 and 5xx responses (and `FatalAPIError` for other 4xx), but the retry wait is computed purely from the exponential generator, so a tap may wait too long or retry too early relative to the server's actual reset window.
 
 ### Affected Components
 
-Based on reading the codebase (to be confirmed during Phase II reproduction):
+Based on reading the codebase (to be confirmed during Phase II):
 
-- **`src/backend/InvenTree/part/models.py`** — the `Part` model, where `trackable` is defined alongside `component`, `assembly`, `salable`, `virtual`. The new `require_serial` field would live here. Also home to `validate_serial_number()`, `get_latest_serial_number()`, `get_next_serial_number()`.
-- **`src/backend/InvenTree/part/migrations/`** — a new auto-generated migration for the added field.
-- **`src/backend/InvenTree/part/serializers.py`** — expose the new field in the Part API.
-- **`src/backend/InvenTree/stock/models.py`** — `StockItem.clean()` / `validate_unique()` / `serializeStock()`, where serial-related validation already lives; the "serial required" check would be added here so it fires on create and on receiving stock.
-- **`src/backend/InvenTree/stock/serializers.py`** — the stock receive/create serializers, where a missing serial should surface as a field error.
-- **Frontend (React, `src/frontend/src/`)** — the Part edit form needs a toggle for the new field; exact file paths to confirm in Phase II.
-- **Tests** — `part/test_*.py` and `stock/test_*.py`.
+- **`singer_sdk/streams/rest.py`** — the `RESTStream` class and its retry/backoff machinery:
+  - `backoff_wait_generator()` — currently `backoff.expo(factor=2)`; header-blind.
+  - `backoff_runtime()` — a generator-based alternative that *can* derive wait time from the raised exception (and thus the response). This is the natural hook for header-aware waits.
+  - `request_decorator()` — wires up `backoff.on_exception`, catching `RetriableAPIError`, timeouts, connection errors.
+  - `validate_response()` — raises `RetriableAPIError` (with the `response` attached) on 429/5xx.
+- **`singer_sdk/exceptions.py`** — `RetriableAPIError` carries the failed `response`, which is how the backoff layer can read headers off the throttled response.
+- **Tests** — `tests/core/rest/` (or equivalent) for the REST stream backoff behavior.
+- **Docs** — the SDK docs page describing custom backoff, if the default behavior changes.
 
 ---
 
@@ -47,59 +48,65 @@ Based on reading the codebase (to be confirmed during Phase II reproduction):
 
 ### Environment Setup
 
-[Notes on setting up your local development environment - challenges you faced, how you solved them]
+[Phase II — notes on cloning my fork and setting up the Meltano SDK dev environment (uv / hatch, pre-commit, pytest), including any challenges and how I solved them]
 
 ### Steps to Reproduce
 
-1. [Step 1]
-2. [Step 2]
-3. [Observed result]
+1. [Phase II — build/use a minimal RESTStream against a mock API that returns 429 with an `X-RateLimit-Reset` header]
+2. [Phase II — observe the SDK's wait time before retrying]
+3. [Phase II — confirm the wait is driven by exponential backoff, NOT by the reset header]
 
 ### Reproduction Evidence
 
 - **Commit showing reproduction:** [Link to commit in your fork]
-- **Screenshots/logs:** [If applicable]
-- **My findings:** [What you discovered during reproduction]
+- **Screenshots/logs:** [Retry log lines showing the wait time vs. the header value]
+- **My findings:** [What I discovered during reproduction]
 
 ---
 
 ## Solution Approach
-Make trackable functionally ternary: in addition to "no" and "optional" (the current behavior of trackable = true), add a "required" state. This would enforce serials when stock items are added or received.
 
-This could be implemented as a second boolean "require serial" which is only respected when trackable=true.
+Per the maintainer (@ReubenFrankel, Oct 2025), the agreed direction is to **implement `X-RateLimit`-aware backoff within the existing backoff mechanism** — *not* to undertake the larger refactor to `requests`/urllib3 native retries, which is being deferred because of open questions about `RetriableAPIError` compatibility.
 
 ### Analysis
 
-This isn't a bug — it's missing functionality. The root cause is that "trackable" encodes only two states (off / on-but-optional). InvenTree's serial validation is written defensively: it constrains a serial *if one exists*, but never asserts that one *must* exist. So there is simply no field to express "required" and no check that reads such a field. The fix is additive: introduce the missing state and the missing assertion.
+This is missing functionality, not a bug. The reason headers are ignored is structural: `backoff_wait_generator()` produces wait times but has **no access to the response/exception**, so it physically can't read a header. The SDK already exposes `backoff_runtime()`, which *is* given the raised exception (and `RetriableAPIError` already carries the `response`). So the pieces exist — the default path just doesn't use them to consult `X-RateLimit-Reset`.
 
 ### Proposed Solution
 
-Add a `require_serial` BooleanField to the `Part` model (default `False`) that is only meaningful when `trackable=True`. Surface it through the Part serializer and a toggle in the React part-edit form. Then add one validation rule to `StockItem` (in `clean()`/serializer validation) that raises a `ValidationError` when the part has `require_serial=True` and no serial is provided — covering both manual stock creation and receiving stock against a purchase order. This is the lower-risk of the two options in the issue (a second boolean) because it leaves the existing `trackable` field and all current behavior untouched, and only activates new behavior when a user opts in.
+Make the default backoff header-aware: when a retriable response carries `X-RateLimit-Reset` (and/or `Retry-After`), derive the wait from that header; otherwise fall back to the existing exponential generator. Implementation-wise this means routing the default retry through a runtime/value function (via `backoff_runtime()` or an equivalent hook) that:
+
+1. Reads the `response` off the `RetriableAPIError`.
+2. Parses `X-RateLimit-Reset` (handling the two real-world encodings — IETF delta-seconds vs. a Unix epoch timestamp that some APIs like GitHub use), and `Retry-After` as a complementary case.
+3. Returns the computed wait, clamped sensibly (non-negative, capped to avoid pathological values).
+4. Falls back to `backoff_wait_generator()` when no usable header is present.
+
+This must stay **backwards-compatible**: taps that already override `backoff_wait_generator()` should keep working unchanged. (Open design question to confirm with the maintainer: whether header-aware backoff is on by default or behind an opt-in, and exactly which headers/encodings to support — I'll confirm in the issue/PR thread before finalizing.)
 
 ### Implementation Plan
 
 Using UMPIRE framework (adapted):
 
-**Understand:** Trackable parts allow but don't require serials. We need an opt-in "serial required" rule that blocks creating/receiving stock for such a part without a serial.
+**Understand:** The default REST backoff ignores `X-RateLimit-*` headers and always uses exponential backoff. We want it to respect `X-RateLimit-Reset` (and `Retry-After`) when present, falling back to exponential otherwise, within the existing `backoff` mechanism.
 
-**Match:** The codebase already has the exact patterns I need:
-- Boolean part flags (`trackable`, `assembly`, `salable`) defined together in `part/models.py` — model the new field the same way.
-- Serial-conditional validation already exists in `stock/models.py` (`clean()` raises `ValidationError` when a serialized item's quantity ≠ 1). I add a sibling rule there.
-- Existing migrations in `part/migrations/` show the project's migration style.
+**Match:** The codebase already has the patterns needed:
+- `backoff_runtime()` exists precisely to compute waits from the raised exception.
+- `RetriableAPIError` already stores the `response`, so headers are reachable.
+- `validate_response()` already classifies 429/5xx as retriable.
+- The `backoff` library supports runtime/value-based waits alongside `backoff.expo`.
 
 **Plan:**
-1. Add `require_serial = models.BooleanField(default=False, ...)` to `Part` in `part/models.py`.
-2. Generate the migration via `invoke migrate` / `makemigrations`.
-3. Add the field to the Part serializer in `part/serializers.py`.
-4. Add validation in `StockItem.clean()` (and/or the stock create/receive serializer) raising `ValidationError` when `self.part.require_serial` is true and no serial is set.
-5. Add a toggle for the field in the React part-edit form.
-6. Add unit tests in `part/` and `stock/` covering the new rule.
+1. Add a helper that extracts a wait duration from a response's `X-RateLimit-Reset` / `Retry-After` headers (handling delta-seconds vs. epoch, missing/invalid values).
+2. Wire the default retry path to use that helper, falling back to `backoff_wait_generator()` when no header is usable.
+3. Preserve overridability so existing custom `backoff_wait_generator()` implementations are unaffected.
+4. Add unit tests covering header-present, header-absent, and malformed-header cases.
+5. Update docs describing the new default behavior.
 
 **Implement:** [Link to your branch/commits here as you work — Phase III]
 
-**Review:** [Self-review against InvenTree CONTRIBUTING.md: migrations committed, `invoke dev.test` passes, pre-commit/linters clean, frontend translations updated if needed — Phase III]
+**Review:** [Self-review against the SDK's contributing guide: pre-commit/lint passes, `pytest` green, type hints, changelog/docs updated, backwards compatibility preserved — Phase III]
 
-**Evaluate:** Backend unit tests + manual test: create a part with `require_serial=True`, attempt to receive stock without a serial, confirm it's rejected; with a serial, confirm it succeeds.
+**Evaluate:** Unit tests + a manual run of a RESTStream against a mock 429 + `X-RateLimit-Reset` response, confirming the retry waits for the header-specified duration (and still falls back to exponential when the header is absent).
 
 ---
 
@@ -107,20 +114,20 @@ Using UMPIRE framework (adapted):
 
 ### Unit Tests (planned — to implement in Phase III)
 
-- [ ] Creating a StockItem for a part with `require_serial=True` and **no** serial raises `ValidationError`.
-- [ ] Creating a StockItem for the same part **with** a valid serial succeeds.
-- [ ] A part with `require_serial=False` (default) keeps existing behavior — stock with no serial is accepted.
-- [ ] `require_serial=True` has no effect when `trackable=False` (or is disallowed/ignored, per maintainer guidance).
-- [ ] The new field round-trips through the Part API serializer (read + write).
+- [ ] 429 response **with** `X-RateLimit-Reset` (delta-seconds) → backoff waits the header-specified duration.
+- [ ] 429 response **with** `X-RateLimit-Reset` as a Unix epoch timestamp → wait computed correctly relative to "now".
+- [ ] 429 response **with** `Retry-After` and no `X-RateLimit-Reset` → respects `Retry-After`.
+- [ ] 429/5xx response with **no** rate-limit headers → falls back to exponential `backoff_wait_generator()` (existing behavior unchanged).
+- [ ] Malformed/negative/empty header value → safe fallback, no crash.
+- [ ] A tap that **overrides** `backoff_wait_generator()` still behaves as before (backwards compatibility).
 
 ### Integration Tests (planned)
 
-- [ ] Receiving stock against a purchase order without a serial is blocked when `require_serial=True`.
-- [ ] The React part-edit form shows and persists the new toggle.
+- [ ] End-to-end RESTStream run against a mock API that throttles then recovers, asserting total wait aligns with the reset header.
 
 ### Manual Testing
 
-[To be filled in Phase III — results of manually creating a required-serial part and attempting to receive stock with and without a serial]
+[Phase III — results of running a minimal tap against a mock rate-limited endpoint, with retry log output]
 
 ---
 
@@ -149,10 +156,11 @@ Using UMPIRE framework (adapted):
 **PR Description:** [Draft or final PR description - much of the content above can be adapted]
 
 **Maintainer Feedback:**
-- [Date]: [Summary of feedback received]
-- [Date]: [How you addressed it]
+- 2026-06-04 (approx.): @ReubenFrankel confirmed to start with `X-RateLimit`-aware backoff within the existing mechanism rather than the native-retries refactor; shared a Slack thread from the original tap-auth0 work as context.
+- [Date]: [Further feedback received]
+- [Date]: [How I addressed it]
 
-**Status:** [Awaiting review / Iterating / Approved / Merged]
+**Status:** Awaiting PR (Phase II/III in progress)
 
 ---
 
@@ -174,8 +182,10 @@ Using UMPIRE framework (adapted):
 
 ## Resources Used
 
-- Issue #11258 — https://github.com/inventree/InvenTree/issues/11258
-- InvenTree `Part` model — `src/backend/InvenTree/part/models.py` (`trackable` field + serial helper methods)
-- InvenTree `StockItem` model — `src/backend/InvenTree/stock/models.py` (existing serial validation in `clean()` / `validate_unique()` / `serializeStock()`)
-- InvenTree contributor docs — https://docs.inventree.org/en/latest/develop/contributing/
-- [Add migration/Django docs and any Stack Overflow / discussion links you use during Phase II–III]
+- Issue #2012 — https://github.com/meltano/sdk/issues/2012
+- Meltano Singer SDK repo — https://github.com/meltano/sdk
+- `RESTStream` backoff implementation — `singer_sdk/streams/rest.py` (`backoff_wait_generator`, `backoff_runtime`, `request_decorator`, `validate_response`)
+- `RetriableAPIError` / `FatalAPIError` — `singer_sdk/exceptions.py`
+- IETF RateLimit headers draft — https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers/
+- Python `backoff` library docs — https://github.com/litl/backoff
+- [Add the tap-auth0 Slack thread link and SDK contributing docs as you use them in Phase II–III]
