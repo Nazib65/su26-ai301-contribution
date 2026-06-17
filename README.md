@@ -3,7 +3,7 @@
 **Contribution Number:** 1
 **Student:** Nazib Irfan Khan  
 **Issue:** https://github.com/meltano/sdk/issues/2012  
-**Status:** Phase I Complete
+**Status:** Phase II Complete
 
 ---
 
@@ -34,8 +34,8 @@ The default backoff ignores response headers entirely. `RESTStream.backoff_wait_
 Based on reading the codebase (to be confirmed during Phase II):
 
 - **`singer_sdk/streams/rest.py`** — the `RESTStream` class and its retry/backoff machinery:
-  - `backoff_wait_generator()` — currently `backoff.expo(factor=2)`; header-blind.
-  - `backoff_runtime()` — a generator-based alternative that *can* derive wait time from the raised exception (and thus the response). This is the natural hook for header-aware waits.
+  - `backoff_wait_generator()` — currently `backoff.expo(factor=2)`; header-blind. **This is the method I changed** (the `backoff` library sends the raised exception into this generator on each retry, which makes header-aware waits possible here).
+  - `backoff_runtime()` — a related generator-based alternative; considered but not needed for this approach.
   - `request_decorator()` — wires up `backoff.on_exception`, catching `RetriableAPIError`, timeouts, connection errors.
   - `validate_response()` — raises `RetriableAPIError` (with the `response` attached) on 429/5xx.
 - **`singer_sdk/exceptions.py`** — `RetriableAPIError` carries the failed `response`, which is how the backoff layer can read headers off the throttled response.
@@ -48,19 +48,48 @@ Based on reading the codebase (to be confirmed during Phase II):
 
 ### Environment Setup
 
-[Phase II — notes on cloning my fork and setting up the Meltano SDK dev environment (uv / hatch, pre-commit, pytest), including any challenges and how I solved them]
+I cloned my fork to `c:\dev\sdk` and added the original repo as an `upstream` remote so I can pull in the latest `meltano/sdk` changes:
+
+```
+git clone https://github.com/Nazib65/sdk.git
+git remote add upstream https://github.com/meltano/sdk.git
+```
+
+The SDK's `docs/CONTRIBUTING.md` specifies the toolchain: **uv** (dependency/venv manager), **pre-commit**, and **nox** (Python 3.10–3.14). Setup steps:
+
+```
+uv tool install pre-commit
+uv tool install nox
+uv sync --all-groups --all-extras   # builds the venv + installs all deps
+pre-commit install                  # enable lint/format hooks on commit
+```
+
+`uv sync` provisioned a managed **CPython 3.14.4** virtualenv and installed 135 packages (the editable `singer-sdk`, `pytest`, and `python-backoff` 2.3.1 — the library at the core of this issue).
+
+**Challenge:** system Python wasn't on my PATH (Windows pointed `python` at the Microsoft Store alias). This turned out not to be a blocker — `uv` downloads and manages its own Python, so `uv sync` provisioned 3.14.4 automatically without a separate Python install.
+
+**Verification:** the existing REST backoff tests pass on a clean checkout —
+
+```
+uv run pytest tests/core/rest/test_failure.py -q
+# 13 passed in 0.19s
+```
 
 ### Steps to Reproduce
 
-1. [Phase II — build/use a minimal RESTStream against a mock API that returns 429 with an `X-RateLimit-Reset` header]
-2. [Phase II — observe the SDK's wait time before retrying]
-3. [Phase II — confirm the wait is driven by exponential backoff, NOT by the reset header]
+This is a missing-feature gap, so I demonstrated it by inspecting the existing code path (plus a real downstream failure) rather than by triggering a crash inside the SDK:
+
+1. On upstream `main`, `RESTStream.backoff_wait_generator()` is literally `return backoff.expo(factor=2)` — it never inspects the response, so `X-RateLimit-Reset` / `Retry-After` headers are ignored.
+2. `validate_response()` turns a 429 into a `RetriableAPIError` **with the response attached**, but the retry wait is computed purely from the exponential generator — the header value is never read. So a tap waits an arbitrary exponential delay instead of the exact reset window the server advertised.
+3. Real-world evidence of the impact: downstream PR [Matatika/tap-outbrain#61](https://github.com/Matatika/tap-outbrain/pull/61) shows a tap had to hand-write header-aware backoff because the SDK has no default — and that workaround crashed with `AttributeError: 'NoneType' object has no attribute 'status_code'` when a connection-level error (e.g. `RemoteDisconnected`) arrived with **no `.response`**. That proves both (a) the SDK doesn't respect these headers by default, and (b) any default implementation must guard against retriable errors that carry no response.
 
 ### Reproduction Evidence
 
-- **Commit showing reproduction:** [Link to commit in your fork]
-- **Screenshots/logs:** [Retry log lines showing the wait time vs. the header value]
-- **My findings:** [What I discovered during reproduction]
+- **Working branch (my fork):** https://github.com/Nazib65/sdk/tree/feat/respect-ratelimit-headers
+- **Baseline behavior:** before my change, `backoff_wait_generator()` returned `backoff.expo(factor=2)` (upstream `singer_sdk/streams/rest.py`) — header-blind.
+- **Downstream crash showing the need + the edge case:** [Matatika/tap-outbrain#61](https://github.com/Matatika/tap-outbrain/pull/61).
+- **Maintainer confirmation of the design:** @edgarrmondragon — *"respect RateLimit headers when they're available, and fall back to exponential backoff when they're not."*
+- **My findings:** the gap is structural — the wait generator had no access to the response/exception, so it physically couldn't read a header. The `backoff` library, however, already *sends* the raised exception into the wait generator on each retry; the fix taps into that to read `.response` headers (with a `None`-response guard for connection errors/timeouts), falling back to exponential otherwise.
 
 ---
 
@@ -70,43 +99,44 @@ Per the maintainer (@ReubenFrankel, Oct 2025), the agreed direction is to **impl
 
 ### Analysis
 
-This is missing functionality, not a bug. The reason headers are ignored is structural: `backoff_wait_generator()` produces wait times but has **no access to the response/exception**, so it physically can't read a header. The SDK already exposes `backoff_runtime()`, which *is* given the raised exception (and `RetriableAPIError` already carries the `response`). So the pieces exist — the default path just doesn't use them to consult `X-RateLimit-Reset`.
+This is missing functionality, not a bug. The original `backoff_wait_generator()` simply returned `backoff.expo(factor=2)` and **ignored the exception that the `backoff` library sends into the generator before each retry**. Because the wait was computed without ever looking at the response, the server's `X-RateLimit-Reset` / `Retry-After` headers had no effect. The key realization: `backoff` already feeds the raised exception into the wait generator via `.send()`, and `RetriableAPIError` already carries the failed `response` — so a header-aware default is achievable by making the generator *read* that exception, as long as it guards against retriable errors that have no response (connection resets, timeouts).
 
 ### Proposed Solution
 
-Make the default backoff header-aware: when a retriable response carries `X-RateLimit-Reset` (and/or `Retry-After`), derive the wait from that header; otherwise fall back to the existing exponential generator. Implementation-wise this means routing the default retry through a runtime/value function (via `backoff_runtime()` or an equivalent hook) that:
+Make the default backoff header-aware while keeping exponential backoff as the fallback. The implementation adds/changes three methods in `singer_sdk/streams/rest.py`:
 
-1. Reads the `response` off the `RetriableAPIError`.
-2. Parses `X-RateLimit-Reset` (handling the two real-world encodings — IETF delta-seconds vs. a Unix epoch timestamp that some APIs like GitHub use), and `Retry-After` as a complementary case.
-3. Returns the computed wait, clamped sensibly (non-negative, capped to avoid pathological values).
-4. Falls back to `backoff_wait_generator()` when no usable header is present.
+1. **`backoff_wait_generator()`** — rewritten as a stateful generator. It primes an internal `backoff.expo(factor=2)` fallback, then on each retry receives the thrown exception, reads `.response` (guarding for `None`), and asks `get_wait_time_from_response()` for a header-based wait — falling back to the exponential value when there's no usable header or no response.
+2. **`get_wait_time_from_response(response)`** (new) — reads standard headers in precedence order: `Retry-After` (RFC 9110 — seconds *or* an HTTP date), then `X-RateLimit-Reset` (IETF RateLimit draft — interpreted as seconds until reset). Returns `None` when neither is usable. This is the clean override point for APIs with non-standard rate-limit headers.
+3. **`_parse_retry_after()`** (new, static) — parses a numeric seconds value or an HTTP date, treats a timezone-naive date as UTC, and clamps the result to `>= 0`.
 
-This must stay **backwards-compatible**: taps that already override `backoff_wait_generator()` should keep working unchanged. (Open design question to confirm with the maintainer: whether header-aware backoff is on by default or behind an opt-in, and exactly which headers/encodings to support — I'll confirm in the issue/PR thread before finalizing.)
+This stays **backwards-compatible**: taps that override `backoff_wait_generator()` keep working unchanged, and `get_wait_time_from_response()` gives taps with bespoke headers a smaller, targeted override point. (Note: `X-RateLimit-Reset` is interpreted as delta-seconds per the IETF draft; epoch-timestamp variants would be handled by overriding `get_wait_time_from_response()`.) Design confirmed by @edgarrmondragon: *"respect RateLimit headers when available, fall back to exponential when not."*
 
 ### Implementation Plan
 
 Using UMPIRE framework (adapted):
 
-**Understand:** The default REST backoff ignores `X-RateLimit-*` headers and always uses exponential backoff. We want it to respect `X-RateLimit-Reset` (and `Retry-After`) when present, falling back to exponential otherwise, within the existing `backoff` mechanism.
+**Understand:** The default REST backoff ignored `X-RateLimit-*` / `Retry-After` headers and always used exponential backoff. It should respect those headers when present and fall back to exponential otherwise — within the existing `backoff` mechanism, and without breaking taps that customize backoff.
 
-**Match:** The codebase already has the patterns needed:
-- `backoff_runtime()` exists precisely to compute waits from the raised exception.
+**Match:** The codebase already had the patterns needed:
+- The `backoff` library `.send()`s the raised exception into the wait generator on each retry — the hook I exploited.
 - `RetriableAPIError` already stores the `response`, so headers are reachable.
-- `validate_response()` already classifies 429/5xx as retriable.
-- The `backoff` library supports runtime/value-based waits alongside `backoff.expo`.
+- `validate_response()` already classifies 429/5xx as retriable (and connection errors/timeouts are retried with no response — the case to guard).
+- `email.utils.parsedate_to_datetime` (stdlib) parses HTTP-date `Retry-After` values.
 
 **Plan:**
-1. Add a helper that extracts a wait duration from a response's `X-RateLimit-Reset` / `Retry-After` headers (handling delta-seconds vs. epoch, missing/invalid values).
-2. Wire the default retry path to use that helper, falling back to `backoff_wait_generator()` when no header is usable.
-3. Preserve overridability so existing custom `backoff_wait_generator()` implementations are unaffected.
-4. Add unit tests covering header-present, header-absent, and malformed-header cases.
-5. Update docs describing the new default behavior.
+1. Rewrite `backoff_wait_generator()` to read the per-retry exception and delegate to a header helper, with a primed exponential fallback.
+2. Add `get_wait_time_from_response()` to read `Retry-After` then `X-RateLimit-Reset`.
+3. Add `_parse_retry_after()` to handle numeric vs. HTTP-date values, UTC-naive dates, and clamping.
+4. Add unit tests for header-present, precedence, clamping, unparsable, HTTP-date, and tz-naive cases, plus a generator-level fallback test.
 
-**Implement:** [Link to your branch/commits here as you work — Phase III]
+**Implement:** Branch — https://github.com/Nazib65/sdk/tree/feat/respect-ratelimit-headers
+- `2c996ee` feat(taps): Respect rate-limit headers in the default REST backoff
+- `dbd417d` test(taps): Cover clamped and unparsable rate-limit header waits
+- `f17ce32` test(taps): Cover Retry-After dates without timezone info
 
-**Review:** [Self-review against the SDK's contributing guide: pre-commit/lint passes, `pytest` green, type hints, changelog/docs updated, backwards compatibility preserved — Phase III]
+**Review:** Self-review against the SDK contributing guide — `pre-commit` hooks installed and run, `nox` / `pytest` green, full type hints, docstrings with `.. versionadded::`, and backwards compatibility preserved.
 
-**Evaluate:** Unit tests + a manual run of a RESTStream against a mock 429 + `X-RateLimit-Reset` response, confirming the retry waits for the header-specified duration (and still falls back to exponential when the header is absent).
+**Evaluate:** Unit tests in `tests/core/rest/test_failure.py` assert the wait equals the header value (e.g. `Retry-After: 30` → `30`) and that an unparsable header falls back to exponential (→ `2`). Full suite stays green.
 
 ---
 
