@@ -3,7 +3,7 @@
 **Contribution Number:** 1
 **Student:** Nazib Irfan Khan  
 **Issue:** https://github.com/meltano/sdk/issues/2012  
-**Status:** Phase II Complete
+**Status:** Phase III Complete
 
 ---
 
@@ -142,40 +142,57 @@ Using UMPIRE framework (adapted):
 
 ## Testing Strategy
 
-### Unit Tests (planned — to implement in Phase III)
+All tests added in `tests/core/rest/test_failure.py`. Full file: **26 passed in 0.57s** (13 pre-existing + 13 new).
 
-- [ ] 429 response **with** `X-RateLimit-Reset` (delta-seconds) → backoff waits the header-specified duration.
-- [ ] 429 response **with** `X-RateLimit-Reset` as a Unix epoch timestamp → wait computed correctly relative to "now".
-- [ ] 429 response **with** `Retry-After` and no `X-RateLimit-Reset` → respects `Retry-After`.
-- [ ] 429/5xx response with **no** rate-limit headers → falls back to exponential `backoff_wait_generator()` (existing behavior unchanged).
-- [ ] Malformed/negative/empty header value → safe fallback, no crash.
-- [ ] A tap that **overrides** `backoff_wait_generator()` still behaves as before (backwards compatibility).
+### Unit Tests — `get_wait_time_from_response` (parametrized, all passing)
 
-### Integration Tests (planned)
+- [x] `Retry-After: 30` → `30.0` (`retry-after-seconds`)
+- [x] `X-RateLimit-Reset: 45` → `45.0` (`ratelimit-reset-seconds`)
+- [x] `Retry-After` takes precedence over `X-RateLimit-Reset` → `30.0` (`retry-after-precedence`)
+- [x] Zero/negative values clamped to `0.0` (`retry-after-zero`, `retry-after-negative-clamped`, `ratelimit-reset-zero`, `ratelimit-reset-negative-clamped`)
+- [x] Unparsable header → `None` (fall back to exponential) (`retry-after-unparsable`, `ratelimit-reset-unparsable`)
+- [x] No rate-limit headers → `None` (`no-headers`)
+- [x] `Retry-After` as an HTTP date → seconds-from-now (`test_get_wait_time_from_response_http_date`)
+- [x] `Retry-After` HTTP date **without** timezone → interpreted as UTC (`test_get_wait_time_from_response_naive_http_date`)
 
-- [ ] End-to-end RESTStream run against a mock API that throttles then recovers, asserting total wait aligns with the reset header.
+### Generator-level Test — `test_backoff_wait_generator_respects_headers_and_falls_back` (passing)
 
-### Manual Testing
+Drives the rewritten `backoff_wait_generator()` across a realistic exception sequence:
 
-[Phase III — results of running a minimal tap against a mock rate-limited endpoint, with retry log output]
+- [x] 429 with `Retry-After: 30` → waits `30` (header honored)
+- [x] 429 with unparsable header → `2` (exponential fallback)
+- [x] `requests.exceptions.ConnectionError` (no `.response`) → `4` (**no crash** — the tap-outbrain#61 edge case)
+- [x] 429 with no headers → `8` (exponential sequence continues: 2 → 4 → 8)
+
+### Manual / Verification
+
+- Ran the existing suite on a clean checkout before changes: `uv run pytest tests/core/rest/test_failure.py -q` → 13 passed.
+- After implementing: `uv run pytest tests/core/rest/test_failure.py -v` → **26 passed in 0.57s**.
+- `X-RateLimit-Reset` is interpreted as **delta-seconds** (per the IETF draft). Epoch-timestamp variants are intentionally left to a per-tap override of `get_wait_time_from_response()` rather than guessed at automatically.
 
 ---
 
 ## Implementation Notes
 
-### Week [X] Progress
+### Progress
 
-[What you built this week, challenges faced, decisions made]
-
-### Week [Y] Progress
-
-[Continue documenting as you work]
+Implemented the default header-aware backoff and its test suite. The work landed in three commits: the feature first, then two follow-up commits hardening the test coverage (clamped/unparsable values, then timezone-naive HTTP dates). All 26 tests in the REST failure suite pass; pre-commit hooks (Ruff, formatting, type checks) run clean on commit.
 
 ### Code Changes
 
-- **Files modified:** [List]
-- **Key commits:** [Links to important commits]
-- **Approach decisions:** [Why you chose certain approaches]
+- **Files modified:**
+  - `singer_sdk/streams/rest.py` (+97 / −5) — rewrote `backoff_wait_generator()`; added `get_wait_time_from_response()` and the static `_parse_retry_after()` helper; imported `datetime`/`timezone` and `email.utils.parsedate_to_datetime`.
+  - `tests/core/rest/test_failure.py` (+103) — added the parametrized `get_wait_time_from_response` tests, two HTTP-date tests, and the generator-level fallback test.
+- **Key commits** (branch [`feat/respect-ratelimit-headers`](https://github.com/Nazib65/sdk/tree/feat/respect-ratelimit-headers)):
+  - [`2c996ee`](https://github.com/Nazib65/sdk/commit/2c996ee8b3dec55d80bba1ee0caa93254eee12e0) — feat(taps): Respect rate-limit headers in the default REST backoff
+  - [`dbd417d`](https://github.com/Nazib65/sdk/commit/dbd417d8a9e0701dd680972ce0f006b1b7870758) — test(taps): Cover clamped and unparsable rate-limit header waits
+  - [`f17ce32`](https://github.com/Nazib65/sdk/commit/f17ce3283b438dd4415ff491f9a675fa0ef8313c) — test(taps): Cover Retry-After dates without timezone info
+- **Approach decisions:**
+  - **Used `backoff_wait_generator()`, not `backoff_runtime()`.** The `backoff` library already `.send()`s the raised exception into the wait generator on each retry, so I could read the response there directly — avoiding the `backoff_runtime` raise/suppress handshake and falling back to exponential cleanly.
+  - **Guarded against a missing `.response`.** Connection-level retriable errors (e.g. `RemoteDisconnected`, timeouts) carry no response. Reading `error.response.status_code` blindly is exactly what crashed [tap-outbrain#61](https://github.com/Matatika/tap-outbrain/pull/61); my generator checks for `None` and falls back to exponential.
+  - **`Retry-After` precedence over `X-RateLimit-Reset`.** `Retry-After` is the more specific, standardized retry directive (RFC 9110).
+  - **Small, targeted override point.** `get_wait_time_from_response()` is its own method so taps with non-standard headers (or epoch-based reset values) can override just that, not the whole generator — preserving backwards compatibility.
+  - **Stdlib for date parsing.** Used `email.utils.parsedate_to_datetime` for HTTP-date `Retry-After`, treating timezone-naive dates as UTC and clamping negative waits to `0`.
 
 ---
 
