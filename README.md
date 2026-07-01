@@ -3,7 +3,8 @@
 **Contribution Number:** 1
 **Student:** Nazib Irfan Khan  
 **Issue:** https://github.com/meltano/sdk/issues/2012  
-**Status:** Phase III Complete
+**Pull Request:** https://github.com/meltano/sdk/pull/3672  
+**Status:** Phase IV Complete — PR submitted, awaiting maintainer review
 
 ---
 
@@ -198,16 +199,22 @@ Implemented the default header-aware backoff and its test suite. The work landed
 
 ## Pull Request
 
-**PR Link:** [GitHub PR URL when submitted]
+**PR Link:** [meltano/sdk#3672 — feat(taps): Respect rate-limit headers in the default REST backoff](https://github.com/meltano/sdk/pull/3672) (opened 2026-06-08)
 
-**PR Description:** [Draft or final PR description - much of the content above can be adapted]
+**PR Summary:** Makes the SDK's default `RESTStream` backoff read the server's own rate-limit headers — `Retry-After` (seconds or HTTP-date) with precedence, then `X-RateLimit-Reset` — and wait exactly that long before retrying, falling back to the existing exponential backoff when no usable header is present. Adds a new overridable `get_wait_time_from_response()` hook and is fully backwards-compatible. `Closes #2012.`
 
-**Maintainer Feedback:**
-- 2026-06-04 (approx.): @ReubenFrankel confirmed to start with `X-RateLimit`-aware backoff within the existing mechanism rather than the native-retries refactor; shared a Slack thread from the original tap-auth0 work as context.
-- [Date]: [Further feedback received]
-- [Date]: [How I addressed it]
+**CI / Checks (all green):**
+- Codecov: all modified/coverable lines covered; project coverage 94.16%.
+- CodSpeed: no performance change (8 benchmarks untouched).
+- Read the Docs: docs build succeeded (preview generated).
+- Lint/type: `ruff`, `ruff format`, `ty`, and `mypy` clean.
 
-**Status:** Awaiting PR (Phase II/III in progress)
+**Maintainer / Reviewer Feedback:**
+- 2026-06-04 (approx., on issue #2012): @ReubenFrankel confirmed the direction — start with `X-RateLimit`-aware backoff within the existing mechanism rather than the native-retries refactor; shared the original tap-auth0 Slack thread as context. @edgarrmondragon framed the goal: *"respect RateLimit headers when they're available, and fall back to exponential backoff when they're not."* This guidance shaped the design before the PR was opened.
+- 2026-06-08 (on the PR): automated **Sourcery-AI** review raised two points — (1) support `X-RateLimit-Reset` as a Unix **epoch** timestamp (not only the IETF draft's delta-seconds), and (2) consider passing the full exception object to `get_wait_time_from_response()` for override flexibility.
+- 2026-06-08 (my response): pushed the two suggested test additions — zero/negative clamping (`dbd417d`) and the generator's unparsable-header/naive-date fallback (`f17ce32`) — and replied explaining the delta-vs-epoch choice: I implemented delta-seconds per the IETF RateLimit-Headers draft cited in #2012 because auto-detecting delta vs. epoch is ambiguous (a large delta is indistinguishable from a near-future epoch, and guessing wrong risks very long waits), while noting I'd happily switch to epoch or support both if the maintainers prefer — it's a small change and `get_wait_time_from_response()` is the clean override point for it.
+
+**Status:** Awaiting review — the PR is open, CI is green, and I've responded to the automated review. Waiting on a human maintainer's review and iterating on feedback as it arrives.
 
 ---
 
@@ -215,15 +222,23 @@ Implemented the default header-aware backoff and its test suite. The work landed
 
 ### Technical Skills Gained
 
-[What you learned technically]
+- **How a real retry/backoff layer is wired.** I learned that the `backoff` library doesn't just call the wait generator — it `.send()`s the raised exception *into* the generator before each retry. That single fact was the whole solution: it meant the header-aware wait could live inside `backoff_wait_generator()` without any larger refactor, because the throttled response was already reachable through the exception.
+- **HTTP rate-limiting standards in practice.** I read the IETF RateLimit-Headers draft and RFC 9110's `Retry-After`, and learned why the two forms of `Retry-After` (integer seconds vs. an HTTP-date) both need handling, and why `X-RateLimit-Reset` is ambiguous in the wild (delta-seconds vs. Unix epoch).
+- **Writing backwards-compatible framework code.** Splitting the logic into a small, overridable `get_wait_time_from_response()` hook — instead of one big generator — taught me how to add default behavior to a framework without breaking taps that already customize backoff.
+- **Defensive parsing and edge cases.** Guarding for a missing `.response` (connection errors carry none), treating timezone-naive HTTP dates as UTC, and clamping negative waits to zero — the kind of details that separate a demo from mergeable code.
+- **Tooling I hadn't used before:** `uv` for Python env/dependency management, `nox` sessions, and `pre-commit` (Ruff + type checks) enforced on every commit.
 
 ### Challenges Overcome
 
-[What was hard and how you solved it]
+- **The hardest part was realizing the gap was structural, not a bug.** The wait generator physically had no access to the response, so at first it looked like the fix would require a big refactor. Digging into how `backoff` drives the generator revealed it already passes the exception in — that reframed the whole problem and kept the change small.
+- **The `NoneType` crash from the downstream tap.** [tap-outbrain#61](https://github.com/Matatika/tap-outbrain/pull/61) showed a hand-rolled version crashing on connection errors that have no `.response`. I turned that failure into a deliberate test case (`ConnectionError` → exponential fallback, no crash) so my default wouldn't repeat it.
+- **The delta-vs-epoch design decision.** Sourcery-AI flagged that many APIs send `X-RateLimit-Reset` as an epoch timestamp. Deciding to stay with the draft's delta-seconds semantics (rather than guess) — and being able to justify it while leaving a clean override point — was a good exercise in defending a technical choice while staying open to maintainer preference.
 
 ### What I'd Do Differently Next Time
 
-[Reflection on your process]
+- **Open the PR earlier as a draft.** I did a lot of self-review before submitting; opening a draft sooner would have surfaced the automated Sourcery feedback (like the epoch question) earlier and let me shape the design against it from the start.
+- **Ask the design question up front.** The delta-vs-epoch ambiguity was foreseeable from the issue itself — I could have raised it explicitly with the maintainers before writing code rather than defending a choice afterward.
+- **Keep commits scoped from the beginning.** The feature and its follow-up test hardening ended up in three commits; planning the test matrix first would have let me land it as one clean, well-tested change.
 
 ---
 
@@ -235,4 +250,7 @@ Implemented the default header-aware backoff and its test suite. The work landed
 - `RetriableAPIError` / `FatalAPIError` — `singer_sdk/exceptions.py`
 - IETF RateLimit headers draft — https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers/
 - Python `backoff` library docs — https://github.com/litl/backoff
-- [Add the tap-auth0 Slack thread link and SDK contributing docs as you use them in Phase II–III]
+- My pull request — https://github.com/meltano/sdk/pull/3672
+- Downstream evidence (crash + need for the feature) — https://github.com/Matatika/tap-outbrain/pull/61
+- RFC 9110 `Retry-After` — https://www.rfc-editor.org/rfc/rfc9110#field.retry-after
+- SDK contributing guide — `docs/CONTRIBUTING.md` in meltano/sdk (uv, pre-commit, nox toolchain)
